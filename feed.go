@@ -53,20 +53,24 @@ func (c *Client) UserReplies(ctx context.Context, userID string, count int, curs
 	return parseThreadFeed(body)
 }
 
-// LikedPosts fetches the authenticated user's liked thread posts.
+// LikedPosts is not currently supported via the Threads web read API.
+//
+// Meta has removed the dedicated Threads-only liked-feed endpoint
+// (/api/v1/text_feed/text_app_liked_feed/) from www.threads.com. The only
+// remaining liked-content surface, /api/v1/feed/liked/, returns Instagram
+// media (not Threads posts) and is intentionally not exposed by this SDK
+// to avoid mixing payload shapes.
+//
+// As of the current Meta web surface, there is no clean way to list the
+// authenticated user's Threads likes. Track a user's liked-tab manually
+// (e.g. via Threads' own UI) until Meta restores a usable endpoint.
+//
+// _ = ctx, _ = count, _ = cursor — kept for forward-compatible signature.
 func (c *Client) LikedPosts(ctx context.Context, count int, cursor string) (PostPage, error) {
-	params := url.Values{}
-	if count > 0 {
-		params.Set("count", strconv.Itoa(count))
-	}
-	if cursor != "" {
-		params.Set("max_id", cursor)
-	}
-	body, err := c.readGET(ctx, "/api/v1/text_feed/text_app_liked_feed/", params)
-	if err != nil {
-		return PostPage{}, err
-	}
-	return parseThreadFeed(body)
+	_ = ctx
+	_ = count
+	_ = cursor
+	return PostPage{}, fmt.Errorf("%w: liked-posts feed is not currently exposed by the Threads web API", ErrNotFound)
 }
 
 // HomeTimeline fetches the For You / Following home timeline. This endpoint

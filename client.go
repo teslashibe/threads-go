@@ -10,6 +10,7 @@ import (
 	"math"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -42,6 +43,13 @@ const (
 	defaultMaxRetries = 3
 	defaultRetryBase  = 750 * time.Millisecond
 	maxResponseBody   = 32 << 20 // 32 MB
+
+	// defaultReadCooldown / defaultWriteCooldown are the durations the
+	// circuit-breaker holds off new requests after observing a rate-limit
+	// signal. Threads/Instagram's soft-block typically clears within 5–10 min
+	// for reads and 15+ min for writes.
+	defaultReadCooldown  = 5 * time.Minute
+	defaultWriteCooldown = 15 * time.Minute
 )
 
 // Client is a Threads API client. It is safe for concurrent use.
@@ -73,7 +81,14 @@ type Client struct {
 	gapMu     sync.Mutex
 	lastReqAt time.Time
 
-	viewer  *User
+	readCooldown  time.Duration
+	writeCooldown time.Duration
+	rlMu          sync.Mutex
+	rlState       RateLimitState
+	cooldownRead  time.Time
+	cooldownWrt   time.Time
+
+	viewer   *User
 	viewerMu sync.RWMutex
 }
 
@@ -199,12 +214,14 @@ func NewFull(cookies Cookies, auth Auth, opts ...Option) (*Client, error) {
 
 func newBaseClient(opts ...Option) *Client {
 	c := &Client{
-		httpClient: &http.Client{Timeout: 30 * time.Second},
-		readUA:     defaultReadUserAgent,
-		writeUA:    defaultWriteUserAgent,
-		maxRetries: defaultMaxRetries,
-		retryBase:  defaultRetryBase,
-		minGap:     defaultMinGap,
+		httpClient:    &http.Client{Timeout: 30 * time.Second},
+		readUA:        defaultReadUserAgent,
+		writeUA:       defaultWriteUserAgent,
+		maxRetries:    defaultMaxRetries,
+		retryBase:     defaultRetryBase,
+		minGap:        defaultMinGap,
+		readCooldown:  defaultReadCooldown,
+		writeCooldown: defaultWriteCooldown,
 	}
 	for _, o := range opts {
 		o(c)
@@ -265,7 +282,7 @@ func (c *Client) readGET(ctx context.Context, path string, params url.Values) (j
 	if len(params) > 0 {
 		endpoint += "?" + params.Encode()
 	}
-	return c.doWithRetry(ctx, func() (*http.Request, error) {
+	return c.doWithRetry(ctx, false, func() (*http.Request, error) {
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 		if err != nil {
 			return nil, err
@@ -281,7 +298,7 @@ func (c *Client) readPOSTForm(ctx context.Context, path string, form url.Values)
 	}
 	endpoint := readBaseURL + path
 	body := form.Encode()
-	return c.doWithRetry(ctx, func() (*http.Request, error) {
+	return c.doWithRetry(ctx, false, func() (*http.Request, error) {
 		req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, strings.NewReader(body))
 		if err != nil {
 			return nil, err
@@ -338,7 +355,7 @@ func (c *Client) writePOSTForm(ctx context.Context, path string, form url.Values
 	}
 	endpoint := writeBaseURL + path
 	body := form.Encode()
-	return c.doWithRetry(ctx, func() (*http.Request, error) {
+	return c.doWithRetry(ctx, true, func() (*http.Request, error) {
 		req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, strings.NewReader(body))
 		if err != nil {
 			return nil, err
@@ -384,7 +401,7 @@ func (c *Client) writeGET(ctx context.Context, path string, params url.Values) (
 	if len(params) > 0 {
 		endpoint += "?" + params.Encode()
 	}
-	return c.doWithRetry(ctx, func() (*http.Request, error) {
+	return c.doWithRetry(ctx, true, func() (*http.Request, error) {
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 		if err != nil {
 			return nil, err
@@ -412,7 +429,8 @@ func (c *Client) setWriteHeaders(req *http.Request) {
 
 // doWithRetry executes the request returned by build, applying minimum
 // request gap pacing and exponential backoff on transient errors.
-func (c *Client) doWithRetry(ctx context.Context, build func() (*http.Request, error)) (json.RawMessage, error) {
+// isWrite must be true for Bearer write calls, false for cookie read calls.
+func (c *Client) doWithRetry(ctx context.Context, isWrite bool, build func() (*http.Request, error)) (json.RawMessage, error) {
 	attempts := c.maxRetries
 	if attempts < 1 {
 		attempts = 1
@@ -428,6 +446,10 @@ func (c *Client) doWithRetry(ctx context.Context, build func() (*http.Request, e
 			}
 		}
 
+		// Honour any active cooldown before pacing — this is the circuit-breaker.
+		if err := c.waitForCooldownInternal(ctx, isWrite); err != nil {
+			return nil, err
+		}
 		c.waitForGap(ctx)
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
@@ -437,7 +459,7 @@ func (c *Client) doWithRetry(ctx context.Context, build func() (*http.Request, e
 		if err != nil {
 			return nil, fmt.Errorf("%w: building request: %v", ErrRequestFailed, err)
 		}
-		body, err := c.do(req)
+		body, err := c.do(req, isWrite)
 		if err == nil {
 			return body, nil
 		}
@@ -449,7 +471,7 @@ func (c *Client) doWithRetry(ctx context.Context, build func() (*http.Request, e
 	return nil, lastErr
 }
 
-func (c *Client) do(req *http.Request) (json.RawMessage, error) {
+func (c *Client) do(req *http.Request, isWrite bool) (json.RawMessage, error) {
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrRequestFailed, err)
@@ -461,11 +483,27 @@ func (c *Client) do(req *http.Request) (json.RawMessage, error) {
 		return nil, fmt.Errorf("%w: reading body: %v", ErrRequestFailed, readErr)
 	}
 
+	// Capture soft capacity / timing signals regardless of status.
+	c.recordSignals(resp, isWrite)
+
 	if err := mapStatus(resp.StatusCode, body); err != nil {
+		// 429 → trip cooldown so the retry loop (or next caller) waits.
+		if errors.Is(err, ErrRateLimited) {
+			c.tripCooldown(isWrite, c.cooldownFor(isWrite), fmt.Sprintf("HTTP %d", resp.StatusCode))
+		}
 		return nil, err
 	}
 
 	if err := mapFailStatus(resp.StatusCode, body); err != nil {
+		// "Please wait a few minutes" → also a rate-limit signal.
+		if fe, ok := err.(*FailStatusError); ok {
+			msg := strings.ToLower(fe.Message)
+			if strings.Contains(msg, "wait") || strings.Contains(msg, "few minutes") {
+				cd := c.cooldownFor(isWrite)
+				c.tripCooldown(isWrite, cd, "wait-a-few-minutes: "+fe.Message)
+				return nil, fmt.Errorf("%w: cooldown for %s (%s)", ErrRateLimited, cd, fe.Message)
+			}
+		}
 		return nil, err
 	}
 
@@ -544,6 +582,132 @@ func mapFailStatus(code int, body []byte) error {
 	}
 }
 
+// ----------------------------------------------------------------------------
+// Rate-limit circuit-breaker
+// ----------------------------------------------------------------------------
+
+// cooldownFor returns the cooldown duration for the given request kind.
+func (c *Client) cooldownFor(isWrite bool) time.Duration {
+	if isWrite {
+		return c.writeCooldown
+	}
+	return c.readCooldown
+}
+
+// tripCooldown records a rate-limit event and arms the cooldown timer for
+// the appropriate request kind. Concurrent calls are safe.
+func (c *Client) tripCooldown(isWrite bool, d time.Duration, reason string) {
+	c.rlMu.Lock()
+	defer c.rlMu.Unlock()
+	until := time.Now().Add(d)
+	c.rlState.LastBlockedAt = time.Now()
+	c.rlState.BlockedReason = reason
+	c.rlState.WriteBlocked = isWrite
+	if isWrite {
+		if until.After(c.cooldownWrt) {
+			c.cooldownWrt = until
+		}
+	} else {
+		if until.After(c.cooldownRead) {
+			c.cooldownRead = until
+		}
+	}
+}
+
+// waitForCooldownInternal blocks until the per-kind cooldown has elapsed,
+// or the context is cancelled. It is called inside doWithRetry before
+// applying the normal request-gap pacing.
+func (c *Client) waitForCooldownInternal(ctx context.Context, isWrite bool) error {
+	c.rlMu.Lock()
+	var until time.Time
+	if isWrite {
+		until = c.cooldownWrt
+	} else {
+		until = c.cooldownRead
+	}
+	c.rlMu.Unlock()
+
+	if d := time.Until(until); d > 0 {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(d):
+		}
+	}
+	return nil
+}
+
+// recordSignals captures the Instagram/Meta soft-signal response headers
+// that indicate server capacity and request timing. Called after every
+// successful HTTP round-trip regardless of status code.
+func (c *Client) recordSignals(resp *http.Response, isWrite bool) {
+	c.rlMu.Lock()
+	defer c.rlMu.Unlock()
+	if isWrite {
+		c.rlState.LastWriteAt = time.Now()
+	} else {
+		c.rlState.LastReadAt = time.Now()
+	}
+	if v := resp.Header.Get("x-ig-capacity-level"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			c.rlState.CapacityLevel = n
+		}
+	} else {
+		c.rlState.CapacityLevel = -1
+	}
+	c.rlState.PeakTime = resp.Header.Get("x-ig-peak-time") == "1"
+	c.rlState.PeakV2 = resp.Header.Get("x-ig-peak-v2") == "1"
+	if q := resp.Header.Get("x-fb-connection-quality"); q != "" {
+		c.rlState.ConnectionQuality = q
+	}
+	if r := resp.Header.Get("x-ig-origin-region"); r != "" {
+		c.rlState.OriginRegion = r
+	}
+	if r := resp.Header.Get("x-ig-server-region"); r != "" {
+		c.rlState.ServerRegion = r
+	}
+	if ms := resp.Header.Get("x-ig-request-elapsed-time-ms"); ms != "" {
+		if n, err := strconv.Atoi(ms); err == nil {
+			c.rlState.LastServerElapsedMs = n
+		}
+	}
+}
+
+// RateLimit returns a snapshot of the most recent rate-limit observations.
+// Use CooldownReadUntil / CooldownWriteUntil to determine when the client
+// will resume normal operation.
+func (c *Client) RateLimit() RateLimitState {
+	c.rlMu.Lock()
+	defer c.rlMu.Unlock()
+	rs := c.rlState
+	rs.CooldownReadUntil = c.cooldownRead
+	rs.CooldownWriteUntil = c.cooldownWrt
+	return rs
+}
+
+// WaitForCooldown blocks until both the read and write cooldowns have
+// elapsed, or the context is cancelled. Returns ctx.Err() on cancellation.
+// Call this before resuming a batch of requests after a rate-limit event.
+func (c *Client) WaitForCooldown(ctx context.Context) error {
+	c.rlMu.Lock()
+	readUntil := c.cooldownRead
+	writeUntil := c.cooldownWrt
+	c.rlMu.Unlock()
+
+	until := readUntil
+	if writeUntil.After(until) {
+		until = writeUntil
+	}
+	if d := time.Until(until); d > 0 {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(d):
+		}
+	}
+	return nil
+}
+
 // waitForGap enforces the minimum request gap to avoid tripping Threads'
 // behavioural rate limiter.
 func (c *Client) waitForGap(ctx context.Context) {
@@ -573,7 +737,8 @@ func isNonRetriable(err error) bool {
 		errors.Is(err, ErrSessionSuspended) ||
 		errors.Is(err, ErrInvalidParams) ||
 		errors.Is(err, ErrUserAgentMismatch) ||
-		errors.Is(err, ErrWriteAuthRequired)
+		errors.Is(err, ErrWriteAuthRequired) ||
+		errors.Is(err, ErrRateLimited) // cooldown already tripped; don't hammer
 }
 
 func truncate(s string, n int) string {

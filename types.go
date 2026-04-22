@@ -116,7 +116,6 @@ type LinkPreview struct {
 type Thread struct {
 	ID          string `json:"id"`
 	ThreadItems []Post `json:"threadItems"`
-	ThreadType  int    `json:"threadType,omitempty"`
 }
 
 // PostPage is one page of posts from a feed/listing endpoint, with a
@@ -198,6 +197,51 @@ type NotificationPage struct {
 	Notifications []Notification `json:"notifications"`
 	NextCursor    string         `json:"nextCursor,omitempty"`
 	HasNext       bool           `json:"hasNext"`
+}
+
+// RateLimitState is the most recent rate-limit observation for the client.
+//
+// Threads shares Instagram's backend and does NOT publish standard
+// X-RateLimit-* headers. Rate pressure is signalled via:
+//   - "Please wait a few minutes before you try again." JSON body
+//   - HTTP 429 responses
+//   - Soft capacity hints in response headers (x-ig-*, x-fb-connection-quality)
+//
+// CooldownReadUntil / CooldownWriteUntil are set whenever a rate-limit signal
+// is detected. All subsequent requests of the same kind block until the
+// cooldown elapses. Use Client.RateLimit() to read, Client.WaitForCooldown()
+// to block until clear.
+type RateLimitState struct {
+	// Cooldown tracks when the client may resume read / write requests.
+	CooldownReadUntil  time.Time `json:"cooldownReadUntil,omitempty"`
+	CooldownWriteUntil time.Time `json:"cooldownWriteUntil,omitempty"`
+
+	// BlockedReason is a short human-readable description of why the last
+	// cooldown was tripped (e.g. "HTTP 429", "wait-a-few-minutes", "302→login").
+	BlockedReason string `json:"blockedReason,omitempty"`
+
+	// LastBlockedAt is the timestamp of the most recent rate-limit event.
+	LastBlockedAt time.Time `json:"lastBlockedAt,omitempty"`
+
+	// WriteBlocked is true when the most recent rate-limit event was a write.
+	WriteBlocked bool `json:"writeBlocked,omitempty"`
+
+	// LastReadAt / LastWriteAt record the timestamp of the most recent
+	// successful read / write request.
+	LastReadAt  time.Time `json:"lastReadAt,omitempty"`
+	LastWriteAt time.Time `json:"lastWriteAt,omitempty"`
+
+	// Instagram / Meta soft-signal headers. These appear on most responses
+	// from www.threads.com and i.instagram.com.
+	//
+	// CapacityLevel: 0 = degraded, 3 = healthy, -1 = not present in response.
+	CapacityLevel       int    `json:"capacityLevel"`
+	PeakTime            bool   `json:"peakTime,omitempty"`
+	PeakV2              bool   `json:"peakV2,omitempty"`
+	ConnectionQuality   string `json:"connectionQuality,omitempty"`
+	OriginRegion        string `json:"originRegion,omitempty"`
+	ServerRegion        string `json:"serverRegion,omitempty"`
+	LastServerElapsedMs int    `json:"lastServerElapsedMs,omitempty"`
 }
 
 // PostOption configures CreatePost / Reply / Quote.

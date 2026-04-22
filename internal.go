@@ -135,15 +135,18 @@ type textPostInfo struct {
 }
 
 // threadPayload mirrors the thread wrapper used in feed responses.
+//
+// thread_type/thread_item_type are kept as RawMessage because Meta
+// returns them as either int (legacy) or string (newer feeds).
 type threadPayload struct {
-	ID          string        `json:"id"`
-	ThreadType  int           `json:"thread_type"`
-	ThreadItems []threadItem  `json:"thread_items"`
+	ID          string          `json:"id"`
+	ThreadType  json.RawMessage `json:"thread_type"`
+	ThreadItems []threadItem    `json:"thread_items"`
 }
 
 type threadItem struct {
-	Post           postPayload `json:"post"`
-	ThreadItemType int         `json:"thread_item_type"`
+	Post           postPayload     `json:"post"`
+	ThreadItemType json.RawMessage `json:"thread_item_type"`
 }
 
 // hashtagPayload mirrors a hashtag JSON object.
@@ -306,10 +309,7 @@ func toPost(p postPayload) Post {
 }
 
 func toThread(p threadPayload) Thread {
-	t := Thread{
-		ID:         p.ID,
-		ThreadType: p.ThreadType,
-	}
+	t := Thread{ID: p.ID}
 	for _, item := range p.ThreadItems {
 		t.ThreadItems = append(t.ThreadItems, toPost(item.Post))
 	}

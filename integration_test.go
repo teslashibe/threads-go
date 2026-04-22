@@ -17,6 +17,7 @@ package threads
 
 import (
 	"context"
+	"errors"
 	"os"
 	"testing"
 	"time"
@@ -38,7 +39,7 @@ func mustClient(t *testing.T) *Client {
 	if cs.SessionID == "" || cs.CSRFToken == "" {
 		t.Skip("THREADS_SESSIONID / THREADS_CSRFTOKEN not set; skipping integration test")
 	}
-	c, err := New(cs, WithMinRequestGap(2500*time.Millisecond))
+	c, err := New(cs, WithMinRequestGap(4*time.Second))
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -291,12 +292,17 @@ func TestIntegration_LikedPosts(t *testing.T) {
 	c := mustClient(t)
 	ctx := context.Background()
 
-	page, err := c.LikedPosts(ctx, 10, "")
-	if err != nil {
-		t.Fatalf("LikedPosts: %v", err)
+	// Meta no longer exposes a Threads-only liked feed via the web API.
+	// LikedPosts is documented to return ErrNotFound; we assert that
+	// behaviour so a future Meta change forces us to revisit.
+	_, err := c.LikedPosts(ctx, 10, "")
+	if err == nil {
+		t.Fatalf("LikedPosts: expected ErrNotFound, got nil — Meta may have restored the endpoint")
 	}
-	posts := flattenThreads(page.Threads)
-	t.Logf("LikedPosts: %d threads / %d posts", len(page.Threads), len(posts))
+	if !errors.Is(err, ErrNotFound) {
+		t.Fatalf("LikedPosts: expected ErrNotFound, got %v", err)
+	}
+	t.Logf("LikedPosts correctly returns ErrNotFound: %v", err)
 }
 
 func TestIntegration_SearchPosts(t *testing.T) {
