@@ -104,14 +104,19 @@ page,  _ := c.SearchUsers(ctx, "golang", 20)
 ### Threads (posts)
 
 ```go
-page, _ := c.UserThreads(ctx, userID, 25, "")            // a user's posts
-page, _  = c.UserReplies(ctx, userID, 25, "")            // a user's replies
-page, _  = c.LikedPosts(ctx, 25, "")                     // self only
-page, _  = c.SearchPosts(ctx, "golang", 25, "")          // text search
+page, _ := c.UserThreads(ctx, userID, 25, "")            // a user's posts ✓
+page, _  = c.UserReplies(ctx, userID, 25, "")            // a user's replies ✓
 page, _  = c.HomeTimeline(ctx, 25, "")                   // For You — Bearer
 ```
 
 Response: `PostPage{ Threads []Thread; NextCursor string; HasNext bool }`. Each `Thread` is a chain of one or more `Post`s (`ThreadItems`). Use `flattenThreads` (or the iterator helpers) to walk every post.
+
+> **Heads up**: `LikedPosts` and `SearchPosts` are kept as method stubs for
+> forward-compatibility but currently return `ErrNotFound`. Meta has retired
+> both REST endpoints from `www.threads.com` (text search now goes through
+> rotating GraphQL `doc_id`s on the SERP page; the Threads-only liked feed
+> is no longer surfaced separately from the Instagram likes feed). See the
+> *Endpoints covered* table below.
 
 ### Single thread / replies
 
@@ -126,12 +131,17 @@ post, _ := c.GetPost(ctx, postID)                        // focal post only
 ### Engagement / likers
 
 ```go
-likers,    _ := c.GetLikers(ctx, postID)                 // who liked
-reposters, _ := c.GetReposters(ctx, postID)              // who reposted
-quoters,   _ := c.GetQuoters(ctx, postID)                // who quoted
+likers, _ := c.GetLikers(ctx, postID) // who liked ✓ (count always; identities best-effort)
 ```
 
-Likers/reposters/quoters return up to a server-imposed cap (typically 200) in a single response — `HasNext` is always false.
+`GetLikers` returns the public like-count in `NumResults` and a
+best-effort `Users` slice. Meta increasingly hides individual liker
+identities from non-author callers; when that happens you still get
+the accurate count, just an empty user list.
+
+`GetReposters` and `GetQuoters` are kept as method stubs but currently
+return `ErrNotFound` — Meta does not expose those lists publicly via the
+web API. Use `Post.RepostCount` / `Post.QuoteCount` for the aggregates.
 
 ### Social graph
 
@@ -146,10 +156,15 @@ pending,   _ := c.PendingRequests(ctx)                   // private-account requ
 ### Hashtags
 
 ```go
-tags,  _ := c.SearchHashtags(ctx, "golang", 20)
-feed,  _ := c.GetHashtag(ctx, "golang")
-feed,  _  = c.GetHashtagPage(ctx, "golang", 25, cursor)
+tags, _ := c.SearchHashtags(ctx, "golang", 20)        // ✓ list matching tags
+meta, _ := c.GetHashtag(ctx, "golang")                // ✓ tag metadata only
 ```
+
+`GetHashtag` returns metadata (id, name, post counts, follow status). The
+per-tag post feed is no longer exposed as a usable REST endpoint on the
+web — the `/api/v1/tags/{name}/sections/` path returns navigation tabs
+only, with `sections=[]`. `GetHashtagPage` therefore returns `ErrNotFound`.
+Discover hashtag content by walking known users instead.
 
 ### Notifications & discovery (Bearer)
 
@@ -178,16 +193,16 @@ cp := it.Checkpoint()                      // save for next run
 
 Available iterators:
 
-| Iterator | Source |
-|---|---|
-| `NewUserThreadsIterator` | `UserThreads` |
-| `NewUserRepliesIterator` | `UserReplies` |
-| `NewLikedPostsIterator`  | `LikedPosts` |
-| `NewHashtagIterator`     | `GetHashtagPage` |
-| `NewSearchPostsIterator` | `SearchPosts` |
-| `NewHomeTimelineIterator`| `HomeTimeline` (Bearer) |
-| `NewFollowersIterator`   | `GetFollowers` |
-| `NewFollowingIterator`   | `GetFollowing` |
+| Iterator | Source | Status |
+|---|---|---|
+| `NewUserThreadsIterator` | `UserThreads` | ✓ |
+| `NewUserRepliesIterator` | `UserReplies` | ✓ |
+| `NewHomeTimelineIterator`| `HomeTimeline` (Bearer) | ✓ |
+| `NewFollowersIterator`   | `GetFollowers` | ✓ |
+| `NewFollowingIterator`   | `GetFollowing` | ✓ |
+| `NewLikedPostsIterator`  | `LikedPosts` | iterates an `ErrNotFound` source — kept for forward compatibility |
+| `NewHashtagIterator`     | `GetHashtagPage` | iterates an `ErrNotFound` source — kept for forward compatibility |
+| `NewSearchPostsIterator` | `SearchPosts` | iterates an `ErrNotFound` source — kept for forward compatibility |
 
 ### Writes (Bearer required)
 
@@ -286,27 +301,32 @@ and network errors with exponential backoff but **does not retry**
 
 ### Reads (cookie auth, `www.threads.com`)
 
-| Method | Threads endpoint |
-|---|---|
-| `Me` | `GET /api/v1/accounts/current_user/?edit=true` |
-| `GetProfile` | `GET /api/v1/users/{id}/info/` |
-| `GetProfileExtended` | `GET /api/v1/users/{id}/info/?entry_point=profile&from_module=profile_page` |
-| `SearchUsers` | `GET /api/v1/users/search/?q=&count=` |
-| `UserThreads` | `GET /api/v1/text_feed/{id}/profile/` |
-| `UserReplies` | `GET /api/v1/text_feed/{id}/profile/replies/` |
-| `LikedPosts` | `GET /api/v1/text_feed/text_app_liked_feed/` |
-| `SearchPosts` | `GET /api/v1/text_feed/text_search/?q=` |
-| `GetThread` / `GetThreadReplies` | `GET /api/v1/text_feed/{post_id}/replies/` |
-| `GetLikers` | `GET /api/v1/text_feed/{post_id}/likers/` |
-| `GetReposters` | `GET /api/v1/text_feed/{post_id}/reposters/` |
-| `GetQuoters` | `GET /api/v1/text_feed/{post_id}/quoters/` |
-| `GetFollowers` | `GET /api/v1/friendships/{id}/followers/` |
-| `GetFollowing` | `GET /api/v1/friendships/{id}/following/` |
-| `GetFriendship` | `GET /api/v1/friendships/show/{id}/` |
-| `GetFriendships` | `POST /api/v1/friendships/show_many/` |
-| `PendingRequests` | `GET /api/v1/friendships/pending/` |
-| `SearchHashtags` | `GET /api/v1/text_app/tags/search/` |
-| `GetHashtag` | `GET /api/v1/text_app/tags/{name}/feed/` |
+Status legend: ✓ verified end-to-end against the live API · ✗ surface
+removed by Meta — method returns `ErrNotFound`.
+
+| Method | Threads endpoint | Status |
+|---|---|---|
+| `Me` | `GET /api/v1/accounts/current_user/?edit=true` | ✓ |
+| `GetProfile` | `GET /api/v1/users/{id}/info/` | ✓ |
+| `GetProfileExtended` | `GET /api/v1/users/{id}/info/?entry_point=profile&from_module=profile_page` | ✓ |
+| `GetProfileByUsername` | `GET /api/v1/users/search/` then `GetProfile` | ✓ |
+| `SearchUsers` | `GET /api/v1/users/search/?q=&count=` | ✓ |
+| `UserThreads` | `GET /api/v1/text_feed/{id}/profile/` | ✓ |
+| `UserReplies` | `GET /api/v1/text_feed/{id}/profile/replies/` | ✓ |
+| `LikedPosts` | _stub: ErrNotFound_ — Meta retired `/api/v1/text_feed/text_app_liked_feed/` | ✗ |
+| `SearchPosts` | _stub: ErrNotFound_ — Meta retired `/api/v1/text_feed/text_search/` (now GraphQL-only) | ✗ |
+| `GetThread` / `GetThreadReplies` | `GET /api/v1/text_feed/{post_id}/replies/` | ✓ |
+| `GetLikers` | `GET /api/v1/media/{post_id}/likers/` | ✓ (count always; identities best-effort) |
+| `GetReposters` | _stub: ErrNotFound_ — not exposed publicly | ✗ |
+| `GetQuoters` | _stub: ErrNotFound_ — not exposed publicly | ✗ |
+| `GetFollowers` | `GET /api/v1/friendships/{id}/followers/` | ✓ |
+| `GetFollowing` | `GET /api/v1/friendships/{id}/following/` | ✓ |
+| `GetFriendship` | `GET /api/v1/friendships/show/{id}/` | ✓ |
+| `GetFriendships` | `POST /api/v1/friendships/show_many/` | ✓ |
+| `PendingRequests` | `GET /api/v1/friendships/pending/` | ✓ |
+| `SearchHashtags` | `GET /api/v1/tags/search/?q=` | ✓ |
+| `GetHashtag` | `GET /api/v1/tags/web_info/?tag_name=` | ✓ (metadata only) |
+| `GetHashtagPage` | _stub: ErrNotFound_ — `/api/v1/tags/{name}/sections/` returns nav-only | ✗ |
 
 ### Reads (Bearer auth, `i.instagram.com`)
 
@@ -366,7 +386,11 @@ export THREADS_IG_DID=...
 go test -tags=integration -v ./...
 ```
 
-The tests are paced at 2.5s between requests to stay under the limiter.
+The tests are paced at **4 s between requests** (configured via
+`WithMinRequestGap(4*time.Second)`) and run sequentially with `-p 1`. A
+full suite of 13 tests completes in ~2 minutes and burns ~30 requests on
+the supplied session. Increase the gap further if you're sharing one
+cookie set across multiple jobs.
 
 ## Out of scope (V1)
 

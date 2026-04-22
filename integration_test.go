@@ -309,12 +309,15 @@ func TestIntegration_SearchPosts(t *testing.T) {
 	c := mustClient(t)
 	ctx := context.Background()
 
-	page, err := c.SearchPosts(ctx, testHashtag(), 10, "")
-	if err != nil {
-		// Search endpoint may be gated; treat as soft-fail.
-		t.Logf("SearchPosts(%q): %v (endpoint may be gated)", testHashtag(), err)
-		return
+	// Meta has retired the REST text-search endpoint. SearchPosts is
+	// documented to return ErrNotFound; we assert that so a future Meta
+	// change forces us to revisit.
+	_, err := c.SearchPosts(ctx, testHashtag(), 10, "")
+	if err == nil {
+		t.Fatalf("SearchPosts: expected ErrNotFound, got nil — Meta may have restored the endpoint")
 	}
-	posts := flattenThreads(page.Threads)
-	t.Logf("SearchPosts(%q): %d threads / %d posts", testHashtag(), len(page.Threads), len(posts))
+	if !errors.Is(err, ErrNotFound) {
+		t.Fatalf("SearchPosts: expected ErrNotFound, got %v", err)
+	}
+	t.Logf("SearchPosts correctly returns ErrNotFound: %v", err)
 }
