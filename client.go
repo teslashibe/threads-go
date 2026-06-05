@@ -64,10 +64,10 @@ const (
 // Methods that require Bearer auth will return ErrWriteAuthRequired if
 // called on a cookie-only client.
 type Client struct {
-	cookies     Cookies
-	auth        Auth
-	hasCookies  bool
-	hasBearer   bool
+	cookies    Cookies
+	auth       Auth
+	hasCookies bool
+	hasBearer  bool
 
 	httpClient *http.Client
 
@@ -90,6 +90,99 @@ type Client struct {
 
 	viewer   *User
 	viewerMu sync.RWMutex
+
+	// auth (the Bearer token set) is mutable: it can be re-minted on a
+	// write-auth failure when credentials are configured. authMu guards it.
+	authMu sync.RWMutex
+
+	// creds, when set via WithCredentials, lets the client auto re-login
+	// (re-mint the Bearer token) when a write returns an auth failure.
+	creds    Credentials
+	hasCreds bool
+	reauthMu sync.Mutex // serialises re-login so only one runs at a time
+
+	// onTokenRefresh, when set, is invoked with the freshly minted Auth
+	// after a successful auto re-login so the caller can persist it.
+	onTokenRefresh func(Auth)
+}
+
+// Credentials hold the Instagram login used to mint (and auto-refresh) the
+// Bearer token via the Bloks login flow. TOTPSecret is the optional base32
+// authenticator-app secret used to auto-solve app-based two-factor auth.
+type Credentials struct {
+	Username   string
+	Password   string
+	DeviceID   string
+	TOTPSecret string
+}
+
+// WithCredentials configures the client to auto re-login (re-mint its Bearer
+// token) when a write operation fails with an auth error. Pair with
+// WithTokenRefreshCallback to persist the refreshed token.
+func WithCredentials(creds Credentials) Option {
+	return func(c *Client) {
+		c.creds = creds
+		c.hasCreds = creds.Username != "" && creds.Password != ""
+	}
+}
+
+// WithTokenRefreshCallback registers a callback invoked with the new Auth
+// each time the client successfully re-mints its Bearer token, so the caller
+// can persist the updated token / device id.
+func WithTokenRefreshCallback(fn func(Auth)) Option {
+	return func(c *Client) { c.onTokenRefresh = fn }
+}
+
+// getAuth returns a copy of the current Bearer auth under lock.
+func (c *Client) getAuth() Auth {
+	c.authMu.RLock()
+	defer c.authMu.RUnlock()
+	return c.auth
+}
+
+// AuthSnapshot returns a copy of the client's current Bearer auth, reflecting
+// any token re-minted by auto re-login. Callers can persist this to reuse the
+// session instead of logging in again. Returns the zero Auth for cookie-only
+// clients that never held a Bearer token.
+func (c *Client) AuthSnapshot() Auth { return c.getAuth() }
+
+// reauth re-mints the Bearer token from stored credentials and updates the
+// client in place. Serialised so concurrent writers trigger at most one
+// re-login. Returns ErrUnauthorized when no credentials are configured.
+func (c *Client) reauth(ctx context.Context) error {
+	if !c.hasCreds {
+		return ErrUnauthorized
+	}
+	c.reauthMu.Lock()
+	defer c.reauthMu.Unlock()
+
+	res, err := c.performLogin(ctx, LoginParams{
+		Username:   c.creds.Username,
+		Password:   c.creds.Password,
+		DeviceID:   firstNonEmptyStr(c.creds.DeviceID, c.getAuth().DeviceID),
+		TOTPSecret: c.creds.TOTPSecret,
+	})
+	if err != nil {
+		return err
+	}
+	newAuth := Auth{Token: res.Token, UserID: res.UserID, DeviceID: res.DeviceID}
+	c.authMu.Lock()
+	c.auth = newAuth
+	c.hasBearer = true
+	c.authMu.Unlock()
+	if c.onTokenRefresh != nil {
+		c.onTokenRefresh(newAuth)
+	}
+	return nil
+}
+
+func firstNonEmptyStr(vals ...string) string {
+	for _, v := range vals {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
 }
 
 // Option configures a Client.
@@ -376,11 +469,12 @@ func (c *Client) writeSignedPOST(ctx context.Context, path string, payload map[s
 	if payload == nil {
 		payload = map[string]interface{}{}
 	}
+	auth := c.getAuth()
 	if _, ok := payload["_uid"]; !ok {
-		payload["_uid"] = c.auth.UserID
+		payload["_uid"] = auth.UserID
 	}
-	if _, ok := payload["device_id"]; !ok && c.auth.DeviceID != "" {
-		payload["device_id"] = c.auth.DeviceID
+	if _, ok := payload["device_id"]; !ok && auth.DeviceID != "" {
+		payload["device_id"] = auth.DeviceID
 	}
 	jsonBytes, err := json.Marshal(payload)
 	if err != nil {
@@ -418,8 +512,8 @@ func (c *Client) setWriteHeaders(req *http.Request) {
 	req.Header.Set("X-IG-App-ID", appID)
 	req.Header.Set("X-IG-Capabilities", "3brTvx0=")
 	req.Header.Set("X-IG-Connection-Type", "WIFI")
-	if c.auth.Token != "" {
-		req.Header.Set("Authorization", "Bearer "+c.auth.Token)
+	if tok := c.getAuth().Token; tok != "" {
+		req.Header.Set("Authorization", "Bearer "+tok)
 	}
 }
 
@@ -436,6 +530,7 @@ func (c *Client) doWithRetry(ctx context.Context, isWrite bool, build func() (*h
 		attempts = 1
 	}
 	var lastErr error
+	reauthed := false
 	for i := 0; i < attempts; i++ {
 		if i > 0 {
 			wait := c.retryBase * time.Duration(math.Pow(2, float64(i-1)))
@@ -462,6 +557,19 @@ func (c *Client) doWithRetry(ctx context.Context, isWrite bool, build func() (*h
 		body, err := c.do(req, isWrite)
 		if err == nil {
 			return body, nil
+		}
+		// On a write auth failure, re-mint the Bearer token once from stored
+		// credentials and retry. Subsequent build() picks up the new token via
+		// setWriteHeaders/getAuth.
+		if isWrite && c.hasCreds && !reauthed &&
+			(errors.Is(err, ErrUnauthorized) || errors.Is(err, ErrSessionSuspended)) {
+			reauthed = true
+			if rerr := c.reauth(ctx); rerr == nil {
+				i-- // don't consume a retry slot for the re-login round-trip
+				continue
+			}
+			// Re-login failed: surface the original auth error.
+			return nil, err
 		}
 		if isNonRetriable(err) {
 			return nil, err
