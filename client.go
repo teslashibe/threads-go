@@ -140,6 +140,12 @@ func (c *Client) getAuth() Auth {
 	return c.auth
 }
 
+// AuthSnapshot returns a copy of the client's current Bearer auth, reflecting
+// any token re-minted by auto re-login. Callers can persist this to reuse the
+// session instead of logging in again. Returns the zero Auth for cookie-only
+// clients that never held a Bearer token.
+func (c *Client) AuthSnapshot() Auth { return c.getAuth() }
+
 // reauth re-mints the Bearer token from stored credentials and updates the
 // client in place. Serialised so concurrent writers trigger at most one
 // re-login. Returns ErrUnauthorized when no credentials are configured.
